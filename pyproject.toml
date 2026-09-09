@@ -1,0 +1,25 @@
+[project]
+name = "g2-scraper"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Googluu", email = "sneyder.h.rodriguez@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "playwright>=1.62.0",
+    "pydantic>=2.13.5",
+]
+
+[project.scripts]
+g2-scraper = "g2_scraper.main:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
