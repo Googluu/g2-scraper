@@ -120,10 +120,17 @@ origen de los reintentos que agravaron el flag.
 
 `BrowserSession.clear_site_data()` automatiza lo que restauró el acceso a mano:
 
-1. `clear_cookies(domain=...)` sobre `www.g2.com` / `.g2.com` — suelta el token.
+1. Navega a `about:blank` **primero**. Con el JS de G2 aún vivo, sus scripts de
+   analítica vuelven a sembrar cookies mientras se limpia (se verificó: sin
+   este paso quedaban 6 cookies re-creadas; con él, 0).
 2. CDP `Storage.clearDataForOrigin` — localStorage, sessionStorage, IndexedDB,
    cache y service workers de los orígenes de G2.
-3. Pestaña nueva: renderer limpio, sin estado en memoria.
+3. `clear_cookies()` con patrón `(^|\.)g2\.com$` — el token puede estar
+   sembrado en `.g2.com` o en `www.g2.com` según la respuesta que lo emitió.
+4. Pestaña nueva: renderer limpio, sin estado en memoria.
+
+Cada reciclaje verifica y reporta el resultado (`token liberado (quedan N
+cookies de g2.com)`), y advierte explícitamente si `datadome` sobrevivió.
 
 Se acota a los orígenes de G2 deliberadamente, para no destruir el resto del
 perfil.
@@ -150,8 +157,9 @@ Tres señales conductuales se corrigieron:
 una firma plana: nadie navega a cadencia fija. Se sustituyó por una
 distribución log-normal (mediana 13 s, σ 0.55) más una pausa de lectura de
 30–105 s con probabilidad 0.18. El resultado tiene la cola larga del
-comportamiento real: mediana ~15 s, media ~27 s. El throughput baja de
-3.6 req/min (la tasa que se bloqueó) a ~1.6 req/min.
+comportamiento real: mediana ~15 s, media ~27 s. Sumando extracción, dwell y
+las pausas de rotación, el throughput medido baja de **3.6 req/min** (la tasa
+que se bloqueó) a **1.06 req/min**.
 
 **Cadena de `Referer` coherente.** Antes eran 100 cargas top-level sin referer:
 un grafo de navegación imposible para una persona. Ahora cada `goto` declara su
@@ -217,7 +225,62 @@ poblados y conteo de productos únicos.
 
 ---
 
-## 4. Pruebas
+## 4. Resultados medidos
+
+Corrida completa de 100 solicitudes (`data/report.json`):
+
+| Métrica | Valor |
+|---|---|
+| Solicitudes | 100 |
+| Exitosas | **100 (100 %)** |
+| Errores de acceso (bloqueos) | **0** |
+| Errores de DOM | 0 |
+| Reintentos consumidos | 0 |
+| Racha máxima de éxitos | 100 |
+| Reciclajes de sesión | 3 (todos preventivos) |
+| Latencia media / p50 / p95 | 10 935 / 7 725 / 44 247 ms |
+| Deriva de latencia (inicio → fin) | 16 001 → 13 616 ms (**−14.9 %**) |
+| Throughput | 1.06 req/min |
+| Duración total | 5 646 s (94 min) |
+| Dataset | 100 muestras, **100 % con todos los campos** |
+
+**Consistencia.** La racha máxima de éxitos es 100: no hubo una sola
+interrupción. La deriva de latencia es *negativa* (−14.9 %): la iteración 100
+respondió más rápido que la 1, así que no hay degradación acumulada. Las tres
+rotaciones de token cayeron en las solicitudes 30, 61 y 91 — la última justo
+donde la versión anterior se bloqueaba.
+
+**Sobre el p95 de 44 s.** La cola de latencia es enteramente atribuible a las
+8 muestras resueltas vía sub-categoría, y es una ineficiencia del scraper, no
+del sitio:
+
+| | n | media | p50 | máx |
+|---|---|---|---|---|
+| extracción directa | 92 | 7 857 ms | 7 492 ms | 17 635 ms |
+| vía sub-categoría | 8 | 46 329 ms | 45 442 ms | 51 640 ms |
+
+Las 8 solicitudes por encima de 30 s son exactamente las 8 con salto de
+sub-categoría. La causa es `_wait_first_card()`: en una página que **no** lista
+productos, la cascada agota sus cuatro selectores en secuencia
+(15 s + 5 s + 5 s + 5 s = 30 s) antes de concluir que hay que buscar
+sub-categorías. Es tiempo de espera puro, no de red.
+
+Es optimizable: en lugar de agotar la cascada y *después* buscar
+sub-categorías, se puede esperar a que aparezca **lo primero** entre una
+product-card y un enlace `link--chevron` (un único `wait_for_selector` con
+ambos patrones), y ramificar según lo que resuelva. Eso recortaría ~30 s en
+esas 8 muestras y llevaría la media global de ~10.9 s a ~8.2 s. No se aplicó en
+esta corrida para no alterar los datos ya validados.
+
+**Sobre los 73 productos únicos en 100 muestras.** No es un defecto de
+extracción: el mismo producto legítimamente encabeza varias categorías
+relacionadas (*Salesforce Agentforce* es la primera card en 5 categorías de IA;
+*Accenture* en 4 de consultoría). Los 100 `category_slug` son únicos, que es la
+invariante que importa: una muestra por categoría.
+
+---
+
+## 5. Pruebas
 
 `pytest` corre sin red y de forma determinista:
 
@@ -231,7 +294,7 @@ poblados y conteo de productos únicos.
 
 ---
 
-## 5. Límites conocidos
+## 6. Límites conocidos
 
 - **Una sola IP.** La arquitectura reduce el score conductual, pero no cambia el
   origen. Para volumen muy superior al de esta prueba el siguiente paso serían

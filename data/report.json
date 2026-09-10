@@ -1,47 +1,47 @@
 {
-  "generated_at": "2026-09-10T16:24:31.892856+00:00",
-  "duration_s": 74.1,
+  "generated_at": "2026-09-10T18:30:16.660334+00:00",
+  "duration_s": 5645.8,
   "requests": {
-    "total": 2,
-    "successful": 2,
+    "total": 100,
+    "successful": 100,
     "failed": 0,
     "blocked": 0,
     "dom_errors": 0,
     "success_rate_pct": 100.0,
     "access_error_rate_pct": 0.0,
     "total_retries": 0,
-    "throughput_req_per_min": 1.62
+    "throughput_req_per_min": 1.06
   },
   "latency_ms": {
-    "mean": 4994.9,
-    "p50": 4994.9,
-    "p95": 5436.9,
-    "min": 4503.9,
-    "max": 5486.0
+    "mean": 10935.1,
+    "p50": 7724.5,
+    "p95": 44247.0,
+    "min": 4629.2,
+    "max": 51639.7
   },
   "stability": {
-    "max_consecutive_successes": 2,
+    "max_consecutive_successes": 100,
     "max_consecutive_failures": 0,
     "recoveries_after_failure": 0,
     "latency_drift": {
-      "window": 1,
-      "first_mean_ms": 4503.9,
-      "last_mean_ms": 5486.0,
-      "delta_pct": 21.81
+      "window": 10,
+      "first_mean_ms": 16000.6,
+      "last_mean_ms": 13615.5,
+      "delta_pct": -14.91
     }
   },
   "anti_bot": {
     "provider": "DataDome (G2.com)",
     "blocks_detected": 0,
     "signals": {},
-    "session_recycles": 0
+    "session_recycles": 3
   },
   "exception_handling": {
     "strategy": "taxonomia de errores con tratamiento opuesto: los bloqueos anti-bot NO se reintentan (se recicla el token datadome, se re-calienta la sesion y se enfria con escalada 120/300/600s), mientras los fallos de DOM/red si se reintentan con backoff exponencial (8/16s) y cascada de selectores. Ritmo log-normal con presupuesto por sesion, y checkpoint en JSONL que hace la corrida reanudable sin repetir categorias",
     "errors": {}
   },
   "data_quality": {
-    "samples": 94,
+    "samples": 100,
     "field_coverage_pct": {
       "product_id": 100.0,
       "product_name": 100.0,
@@ -54,7 +54,7 @@
       "image_url": 100.0
     },
     "fully_populated_pct": 100.0,
-    "via_subcategory": 6,
-    "unique_products": 69
+    "via_subcategory": 8,
+    "unique_products": 73
   }
 }
