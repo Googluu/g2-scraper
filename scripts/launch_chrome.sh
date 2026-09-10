@@ -1,5 +1,5 @@
-# navegador externo (linux/macos)
 #!/usr/bin/env bash
+# navegador externo (linux/macos)
 # Lanza un Chrome "externo" con debugging remoto (CDP). El scraper se conecta
 # a el: la vida del navegador es independiente de la del script.
 set -euo pipefail

@@ -5,22 +5,30 @@ Fase 2: por cada categoria, navega y extrae la primera product-card.
 
 Fuente primaria de datos: atributos data-event-options (JSON limpio incrustado
 por G2). Fallback: texto del DOM.
+
+Taxonomia de errores (determina la estrategia de recuperacion):
+  BlockedError    -> anti-bot. NO se reintenta: se recicla la sesion y se enfria.
+  NavigationError -> timeout / red. Reintentable con backoff.
+  DomChangedError -> la pagina cargo pero el DOM cambio. Reintentable con backoff.
 """
 import json
+import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlsplit, urlunsplit, urlparse
 
 from playwright.async_api import Page, TimeoutError as PWTimeout
 
+from .antibot import AUTO_RESOLVABLE, BlockedError, detect_block, human_dwell
 from .config import (
   BASE_URL, CATEGORIES_URL, CHALLENGE_WAIT_S,
   ELEMENT_TIMEOUT_MS, NAV_TIMEOUT_MS,
+  WARMUP_DWELL_MAX_S, WARMUP_DWELL_MIN_S,
 )
 from .models import Category
 
 
 class NavigationError(Exception):
-  """No se pudo cargar la pagina (timeout, challenge, red)."""
+  """No se pudo cargar la pagina (timeout, red)."""
 
 
 class DomChangedError(Exception):
@@ -28,53 +36,86 @@ class DomChangedError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# URLs
+# ---------------------------------------------------------------------------
+
+_MULTISLASH = re.compile(r"/{2,}")
+
+
+def absolute_url(href: str) -> str:
+  """URL absoluta y normalizada, relativa a g2.com.
+
+  Colapsa las barras repetidas del path: la version anterior concatenaba
+  BASE_URL + href y producia "https://www.g2.com//categories/x", una forma que
+  ningun navegador conducido por una persona genera y que quedaba registrada en
+  el header Referer que ve DataDome.
+
+  Un href sin esquema que empiece por "//" se trata como ruta con barras
+  duplicadas, no como URL protocol-relative: aqui solo se resuelven rutas de
+  G2, y `urljoin` interpretaria "//categories/x" como host "categories".
+  """
+  href = href.strip()
+  if not urlsplit(href).scheme:
+    href = "/" + href.lstrip("/")
+  url = urljoin(BASE_URL + "/", href)
+  parts = urlsplit(url)
+  return urlunsplit((
+    parts.scheme, parts.netloc, _MULTISLASH.sub("/", parts.path) or "/",
+    parts.query, parts.fragment,
+  ))
+
+
+# ---------------------------------------------------------------------------
 # Navegacion resiliente
 # ---------------------------------------------------------------------------
 
-async def _title(page: Page) -> str:
-  try:
-    return (await page.title()).lower()
-  except Exception:
-    return ""
-
-
-async def _challenge_present(page: Page) -> bool:
-  title = await _title(page)
-  if "just a moment" in title or "attention required" in title:
-    return True
-  try:
-    n = await page.locator(
-      "#challenge-running, #challenge-stage, iframe[src*='challenges.cloudflare.com']"
-    ).count()
-    return n > 0
-  except Exception:
-    return False
-
-
-async def safe_goto(page: Page, url: str) -> None:
-  """Navega a `url` g2.
+async def safe_goto(page: Page, url: str, *, referer: str | None = None) -> None:
+  """Navega a `url` distinguiendo bloqueo de fallo tecnico.
 
   - `domcontentloaded`: mas rapido y tolerante que networkidle.
-  - Si Cloudflare presenta challenge, espera a que se resuelva.
+  - Lee el **status HTTP** de la respuesta principal: la version anterior
+    descartaba el retorno de `page.goto()` y por eso el 403 de DataDome pasaba
+    inadvertido, terminando reportado como `product_card_not_found`.
+  - Un challenge auto-resoluble (device check silencioso) se espera un rato
+    acotado; un bloqueo firme aborta de inmediato con BlockedError.
+  - `referer` da coherencia a la cadena de navegacion: 100 cargas top-level sin
+    referer son un grafo de navegacion imposible para una persona.
   """
   try:
-    await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    response = await page.goto(
+      url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS, referer=referer,
+    )
   except PWTimeout:
+    response = None
     # El DOM puede estar listo aunque recursos lentos disparen el timeout
     if not page.url.startswith("http"):
       raise NavigationError("goto_timeout")
 
+  signal = await detect_block(page, response)
+  if signal is None:
+    return
+
+  if signal not in AUTO_RESOLVABLE:
+    raise BlockedError(signal)
+
+  # Challenge potencialmente auto-resoluble: DataDome recarga la pagina sola si
+  # el device check pasa. Se espera sin reintentar la navegacion.
   deadline = time.monotonic() + CHALLENGE_WAIT_S
   while time.monotonic() < deadline:
-    if not await _challenge_present(page):
+    await page.wait_for_timeout(2000)
+    if await detect_block(page) is None:
       return
-    await page.wait_for_timeout(1500)
-  raise NavigationError("cloudflare_challenge")
+  raise BlockedError(signal)
 
 
 async def accept_cookies(page: Page) -> None:
-  """Cierra el banner de cookies (OneTrust u otros) si aparece."""
-  for selector in ("#onetrust-accept-btn-handler", "button:has-text('Accept')", "#\36 24a1a1f-785f-4407-a368-42444c0ef4f2 > div.osano-cm-dialog__buttons.osano-cm-buttons > button.osano-cm-accept-all.osano-cm-buttons__button.osano-cm-button.osano-cm-button--type_accept"):
+  """Cierra el banner de cookies (OneTrust/Osano u otros) si aparece."""
+  selectors = (
+    "#onetrust-accept-btn-handler",
+    "button.osano-cm-accept-all",
+    "button:has-text('Accept')",
+  )
+  for selector in selectors:
     try:
       btn = page.locator(selector).first
       if await btn.count():
@@ -83,6 +124,26 @@ async def accept_cookies(page: Page) -> None:
         return
     except Exception:
       continue
+
+
+async def warm_up(page: Page) -> None:
+  """Calienta la sesion antes de la fase 2.
+
+  Un token `datadome` recien emitido no tiene credito. Entrar directo a
+  /categories/<slug> con una cookie recien nacida se puntua peor que llegar
+  ahi despues de un recorrido plausible: home -> /categories, con dwell real
+  en cada parada. Esto es lo que hace que una sesion reciclada aguante.
+  """
+  await safe_goto(page, BASE_URL + "/")
+  await accept_cookies(page)
+  await human_dwell(page, deep=True)
+
+  await safe_goto(page, CATEGORIES_URL, referer=BASE_URL + "/")
+  await accept_cookies(page)
+  await human_dwell(page, deep=True)
+  await page.wait_for_timeout(
+    int(1000 * (WARMUP_DWELL_MIN_S + (WARMUP_DWELL_MAX_S - WARMUP_DWELL_MIN_S) / 2))
+  )
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +169,7 @@ def parse_categories(raw: list[dict]) -> list[Category]:
   seen: set[str] = set()
   for item in raw:
     href = item.get("href", "")
-    slug = href.removeprefix("/categories/").strip("/")
+    slug = urlparse(href).path.removeprefix("/categories/").strip("/")
     if not slug or slug in seen:
       continue
     try:
@@ -120,13 +181,13 @@ def parse_categories(raw: list[dict]) -> list[Category]:
       category_id=opts.get("category_id"),
       slug=slug,
       name=item.get("text") or opts.get("category") or slug.replace("-", " ").title(),
-      url=BASE_URL + href,
+      url=absolute_url(href),
     ))
   return categories
 
 
 async def collect_categories(page: Page) -> list[Category]:
-  await safe_goto(page, CATEGORIES_URL)
+  await safe_goto(page, CATEGORIES_URL, referer=BASE_URL + "/")
   await accept_cookies(page)
   await page.wait_for_selector("form#categorySearch", state="attached",
                               timeout=ELEMENT_TIMEOUT_MS)
@@ -259,6 +320,7 @@ els => els.map(el => ({
 }))
 """
 
+
 # en algunos casos G2 no lista sub-categorias, pero si enlaces a otras categorias por si no encontramos la product-card, entonces nevagamos a la primera sub-categoria valida y repetimos ahi
 async def _collect_subcategories(page: Page) -> list[dict]:
   """Sub-categorias visibles (href + nombre), en orden del DOM."""
@@ -289,8 +351,8 @@ def _pick_subcategory(candidates: list[dict], current_slug: str,
     slug = urlparse(href).path.removeprefix("/categories/").strip("/")
     if not slug or slug == current_slug or slug in visited:
       continue
-    url = href if href.startswith("http") else BASE_URL + href
-    return slug, (cand or {}).get("name") or slug.replace("-", " ").title(), url
+    name = (cand or {}).get("name") or slug.replace("-", " ").title()
+    return slug, name, absolute_url(href)
   return None
 
 
@@ -298,6 +360,7 @@ async def extract_first_product(
     page: Page,
     category: Category,
     *,
+    referer: str | None = None,
     _hops: list[str] | None = None,
     _visited: set[str] | None = None,
 ) -> dict:
@@ -320,11 +383,14 @@ async def extract_first_product(
   if len(_hops) >= MAX_SUBCATEGORY_HOPS:
     raise DomChangedError("subcategory_depth_exceeded")
 
-  await safe_goto(page, category.url)
+  await safe_goto(page, category.url, referer=referer or CATEGORIES_URL)
 
   # 1) Camino normal: ¿hay product-cards?
   card = await _wait_first_card(page)
   if card is not None:
+    # El dwell "humano" se hace FUERA de esta funcion (ver Runner.dwell): si se
+    # hiciera aqui, los segundos de scroll simulado contaminarian el
+    # latency_ms que se reporta como tiempo de respuesta por extraccion.
     data = await card.evaluate(EXTRACT_CARD_JS)
     if not data or not data.get("product_name"):
       raise DomChangedError("empty_card")
@@ -332,6 +398,14 @@ async def extract_first_product(
     data["subcategory_hops"] = list(_hops)
     data["resolved_via_subcategory"] = bool(_hops)
     return data
+
+  # 1b) Sin tarjetas puede significar "me bloquearon a mitad de sesion".
+  #     Se verifica ANTES de culpar al DOM: confundir un bloqueo con
+  #     `product_card_not_found` fue lo que disparo los reintentos que
+  #     agravaron el flag en la corrida anterior.
+  signal = await detect_block(page)
+  if signal is not None:
+    raise BlockedError(signal)
 
   # 2) No hay tarjetas -> probablemente es un listado de sub-categorias
   candidates = await _collect_subcategories(page)
@@ -343,5 +417,7 @@ async def extract_first_product(
   print(f"    -> sin product-cards; siguiendo sub-categoria: {sub_slug}")
   sub_category = Category(category_id=None, slug=sub_slug, name=sub_name, url=sub_url)
   return await extract_first_product(
-    page, sub_category, _hops=_hops + [sub_slug], _visited=_visited,
+    page, sub_category,
+    referer=category.url,          # cadena de navegacion coherente
+    _hops=_hops + [sub_slug], _visited=_visited,
   )
